@@ -5,6 +5,7 @@
 #     "fastapi",
 #     "uvicorn",
 #     "httpx",
+#     "logfire[fastapi,httpx]",
 #     "torch",
 #     "diffusers",
 #     "transformers",
@@ -20,6 +21,8 @@ Routes AI workloads through a single queue so the GPU is never contested.
 Proxies chat/embed requests to Ollama. Handles image generation directly
 via diffusers. One worker, one GPU, one job at a time.
 
+Instrumented with Logfire for full observability including gen_ai.* traces.
+
 Usage:
     ./forge.py
     uv run forge.py
@@ -27,18 +30,23 @@ Usage:
 
 import asyncio
 import base64
-import io
+import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+import logfire
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.context import Context
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -47,10 +55,17 @@ from fastapi.responses import JSONResponse
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 FORGE_PORT = int(os.getenv("FORGE_PORT", "8200"))
 IMAGE_DIR = Path(os.getenv("FORGE_IMAGE_DIR", "/Pondside/Alpha-Home/images/imagination"))
-DEFAULT_IMAGE_MODEL = os.getenv("FORGE_IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")  # placeholder until we pick
+DEFAULT_IMAGE_MODEL = os.getenv("FORGE_IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("forge")
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+logfire.configure(service_name="forge")
+
 
 # ---------------------------------------------------------------------------
 # Jobs
@@ -64,6 +79,8 @@ class Job:
     result: Any = None
     error: Exception | None = None
     created_at: float = field(default_factory=time.time)
+    trace_context: Context | None = None  # Carries the caller's trace context into the worker
+    api_span: Any = None  # The root FastAPI span — gen_ai.* attributes go here
 
 
 @dataclass
@@ -74,17 +91,123 @@ class OllamaProxyJob(Job):
     body: dict = field(default_factory=dict)
     headers: dict = field(default_factory=dict)
 
+    @property
+    def _model(self) -> str:
+        """Extract model name from request body."""
+        return self.body.get("model", "unknown")
+
+    @property
+    def _operation(self) -> str:
+        """Infer operation type from path."""
+        if "embed" in self.path:
+            return "embed"
+        elif "chat" in self.path:
+            return "chat"
+        elif "generate" in self.path:
+            return "generate"
+        elif "tags" in self.path:
+            return "list_models"
+        elif "ps" in self.path:
+            return "list_running"
+        return "proxy"
+
+    def _set_api_attr(self, key: str, value: Any):
+        """Set an attribute on the root FastAPI span (for the Model Run panel)."""
+        if self.api_span and self.api_span.is_recording():
+            self.api_span.set_attribute(key, value)
+
     async def execute(self, client: httpx.AsyncClient):
         url = f"{OLLAMA_URL}{self.path}"
-        log.info(f"forge.proxy → {self.method} {url}")
-        resp = await client.request(
-            method=self.method,
-            url=url,
-            json=self.body if self.method in ("POST", "PUT", "PATCH") else None,
-            headers={k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")},
-            timeout=120.0,
-        )
-        self.result = {"status_code": resp.status_code, "body": resp.json(), "headers": dict(resp.headers)}
+
+        # Attach gen_ai.* attributes to the root FastAPI span — one click, Model Run panel
+        self._set_api_attr("gen_ai.operation.name", self._operation)
+        self._set_api_attr("gen_ai.provider.name", "ollama")
+        self._set_api_attr("gen_ai.request.model", self._model)
+
+        # Attach input: system instructions and messages (for chat operations)
+        # Format: Logfire expects {"role": "...", "parts": [{"type": "text", "content": "..."}]}
+        messages = self.body.get("messages", [])
+        if messages:
+            system_msgs = [m for m in messages if m.get("role") == "system"]
+            non_system = [m for m in messages if m.get("role") != "system"]
+            if system_msgs:
+                self._set_api_attr(
+                    "gen_ai.system_instructions",
+                    json.dumps([{"type": "text", "content": m.get("content", "")} for m in system_msgs]),
+                )
+            if non_system:
+                self._set_api_attr(
+                    "gen_ai.input.messages",
+                    json.dumps([
+                        {"role": m.get("role"), "parts": [{"type": "text", "content": m.get("content", "")}]}
+                        for m in non_system
+                    ]),
+                )
+
+        # For Ollama native /api/generate (prompt field, no messages array)
+        if "prompt" in self.body and not messages:
+            self._set_api_attr(
+                "gen_ai.input.messages",
+                json.dumps([{"role": "user", "parts": [{"type": "text", "content": self.body["prompt"]}]}]),
+            )
+
+        # For embeddings, capture the input text
+        if self._operation == "embed":
+            embed_input = self.body.get("input") or self.body.get("prompt", "")
+            if isinstance(embed_input, list):
+                preview = embed_input[0][:200] if embed_input else ""
+            else:
+                preview = str(embed_input)[:200]
+            self._set_api_attr(
+                "gen_ai.input.messages",
+                json.dumps([{"role": "user", "parts": [{"type": "text", "content": preview}]}]),
+            )
+
+        with logfire.span(
+            "forge.{operation} {model}",
+            operation=self._operation,
+            model=self._model,
+        ):
+            resp = await client.request(
+                method=self.method,
+                url=url,
+                json=self.body if self.method in ("POST", "PUT", "PATCH") else None,
+                headers={k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=120.0,
+            )
+
+            body = resp.json()
+            self.result = {"status_code": resp.status_code, "body": body, "headers": dict(resp.headers)}
+
+            # Extract token usage and attach to the root FastAPI span
+            if "prompt_eval_count" in body:
+                self._set_api_attr("gen_ai.usage.input_tokens", body["prompt_eval_count"])
+            if "eval_count" in body:
+                self._set_api_attr("gen_ai.usage.output_tokens", body["eval_count"])
+            if "total_duration" in body:
+                self._set_api_attr("forge.total_duration_ns", body["total_duration"])
+            if "model" in body:
+                self._set_api_attr("gen_ai.response.model", body["model"])
+
+            # Attach output message (for chat operations)
+            # Format: {"role": "...", "parts": [{"type": "text", "content": "..."}]}
+            if "message" in body:
+                self._set_api_attr(
+                    "gen_ai.output.messages",
+                    json.dumps([{"role": body["message"].get("role", "assistant"),
+                                 "parts": [{"type": "text", "content": body["message"].get("content", "")}]}]),
+                )
+            elif "response" in body:
+                # /api/generate returns response as a string
+                self._set_api_attr(
+                    "gen_ai.output.messages",
+                    json.dumps([{"role": "assistant", "parts": [{"type": "text", "content": body["response"]}]}]),
+                )
+            elif "embedding" in body or "embeddings" in body:
+                self._set_api_attr(
+                    "gen_ai.output.messages",
+                    json.dumps([{"role": "assistant", "parts": [{"type": "text", "content": "[embedding vector]"}]}]),
+                )
 
 
 @dataclass
@@ -98,35 +221,62 @@ class ImagineJob(Job):
     height: int = 1024
     seed: int | None = None
 
+    def _set_api_attr(self, key: str, value: Any):
+        """Set an attribute on the root FastAPI span."""
+        if self.api_span and self.api_span.is_recording():
+            self.api_span.set_attribute(key, value)
+
     async def execute(self, client: httpx.AsyncClient):
         """
         The heavy lift: unload Ollama's model, load diffusion model,
         generate image, save to disk, unload diffusion model.
         Ollama reloads its model on next request automatically.
         """
-        log.info(f"forge.imagine → prompt={self.prompt!r}, model={self.model or DEFAULT_IMAGE_MODEL}")
+        model_id = self.model or DEFAULT_IMAGE_MODEL
 
-        # Step 1: Ask Ollama to unload its model
-        await _ollama_unload(client)
+        # Attach gen_ai.* to root FastAPI span
+        self._set_api_attr("gen_ai.operation.name", "imagine")
+        self._set_api_attr("gen_ai.provider.name", "diffusers")
+        self._set_api_attr("gen_ai.request.model", model_id)
+        self._set_api_attr("gen_ai.input.messages", json.dumps([{"role": "user", "parts": [{"type": "text", "content": self.prompt}]}]))
 
-        # Step 2: Generate image (runs in thread pool to not block event loop)
-        loop = asyncio.get_event_loop()
-        image_path, gen_time = await loop.run_in_executor(None, self._generate)
+        with logfire.span(
+            "forge.imagine {model}",
+            model=model_id,
+            prompt_preview=self.prompt[:80],
+        ) as span:
+            # Step 1: Ask Ollama to unload its model
+            with logfire.span("forge.imagine.ollama_unload"):
+                await _ollama_unload(client)
 
-        # Step 3: Build result with base64 image for direct context injection
-        with open(image_path, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode("utf-8")
+            # Step 2: Generate image (runs in thread pool to not block event loop)
+            with logfire.span("forge.imagine.generate", steps=self.steps, width=self.width, height=self.height):
+                loop = asyncio.get_event_loop()
+                image_path, gen_time = await loop.run_in_executor(None, self._generate)
 
-        self.result = {
-            "path": str(image_path),
-            "base64": image_b64,
-            "prompt": self.prompt,
-            "model": self.model or DEFAULT_IMAGE_MODEL,
-            "generation_time": gen_time,
-            "width": self.width,
-            "height": self.height,
-        }
-        log.info(f"forge.imagine ✓ {image_path} ({gen_time:.1f}s)")
+            span.set_attribute("forge.generation_time_s", gen_time)
+            span.set_attribute("forge.image_path", str(image_path))
+
+            # Attach output to root FastAPI span
+            self._set_api_attr("forge.generation_time_s", gen_time)
+            self._set_api_attr(
+                "gen_ai.output.messages",
+                json.dumps([{"role": "assistant", "parts": [{"type": "text", "content": f"[image: {image_path.name}] ({gen_time:.1f}s)"}]}]),
+            )
+
+            # Step 3: Build result with base64 image for direct context injection
+            with open(image_path, "rb") as f:
+                image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+            self.result = {
+                "path": str(image_path),
+                "base64": image_b64,
+                "prompt": self.prompt,
+                "model": model_id,
+                "generation_time": gen_time,
+                "width": self.width,
+                "height": self.height,
+            }
 
     def _generate(self) -> tuple[Path, float]:
         """Synchronous image generation. Runs in a thread."""
@@ -178,23 +328,21 @@ class ImagineJob(Job):
 async def _ollama_unload(client: httpx.AsyncClient):
     """Ask Ollama to unload all models from VRAM."""
     try:
-        # List running models
         resp = await client.get(f"{OLLAMA_URL}/api/ps", timeout=10.0)
         if resp.status_code == 200:
             models = resp.json().get("models", [])
             for model in models:
                 model_name = model.get("name", "")
                 if model_name:
-                    log.info(f"forge.ollama_unload → {model_name}")
+                    logfire.info("forge.ollama_unload → {model}", model=model_name)
                     await client.post(
                         f"{OLLAMA_URL}/api/generate",
                         json={"model": model_name, "keep_alive": 0},
                         timeout=30.0,
                     )
-            # Give Ollama a moment to release VRAM
             await asyncio.sleep(2)
     except Exception as e:
-        log.warning(f"forge.ollama_unload failed: {e}")
+        logfire.warning("forge.ollama_unload failed: {error}", error=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -209,17 +357,34 @@ class GPUWorker:
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
         self.current_job: Job | None = None
         self._client: httpx.AsyncClient | None = None
+        self._jobs_completed: int = 0
 
     async def start(self):
         self._client = httpx.AsyncClient()
-        log.info("forge.worker started")
+        logfire.instrument_httpx(self._client)
+        logfire.info("forge.worker started")
         while True:
             job = await self.queue.get()
             self.current_job = job
+            queue_wait = time.time() - job.created_at
             try:
-                await job.execute(self._client)
+                # Attach to the caller's trace context so worker spans
+                # nest inside the HTTP request span (the bar tab pattern)
+                ctx = job.trace_context or otel_context.get_current()
+                token = otel_context.attach(ctx)
+                try:
+                    with logfire.span(
+                        "forge.worker.job",
+                        job_type=type(job).__name__,
+                        queue_wait_s=round(queue_wait, 3),
+                        queue_depth=self.queue.qsize(),
+                    ):
+                        await job.execute(self._client)
+                        self._jobs_completed += 1
+                finally:
+                    otel_context.detach(token)
             except Exception as e:
-                log.error(f"forge.worker error: {e}", exc_info=True)
+                logfire.error("forge.worker error: {error}", error=str(e))
                 job.error = e
             finally:
                 job.done.set()
@@ -228,6 +393,8 @@ class GPUWorker:
 
     async def submit(self, job: Job) -> Any:
         """Submit a job and wait for completion."""
+        # Capture the caller's trace context so the worker can nest under it
+        job.trace_context = otel_context.get_current()
         await self.queue.put(job)
         await job.done.wait()
         if job.error:
@@ -240,6 +407,7 @@ class GPUWorker:
             "queue_depth": self.queue.qsize(),
             "busy": self.current_job is not None,
             "current_job_type": type(self.current_job).__name__ if self.current_job else None,
+            "jobs_completed": self._jobs_completed,
         }
 
 
@@ -250,16 +418,22 @@ class GPUWorker:
 worker = GPUWorker()
 
 
-from contextlib import asynccontextmanager
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(worker.start())
-    log.info(f"Forge listening on port {FORGE_PORT}")
+    logfire.info("Forge listening on port {port}", port=FORGE_PORT)
     yield
     task.cancel()
 
 app = FastAPI(title="Forge", lifespan=lifespan)
+logfire.instrument_fastapi(app)
+
+
+# --- Helpers ---
+
+def _capture_api_span() -> Any:
+    """Grab the current FastAPI span so gen_ai.* attributes land on the root."""
+    return trace.get_current_span()
 
 
 # --- Ollama proxy endpoints ---
@@ -267,7 +441,7 @@ app = FastAPI(title="Forge", lifespan=lifespan)
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
-    job = OllamaProxyJob(method="POST", path="/v1/chat/completions", body=body)
+    job = OllamaProxyJob(method="POST", path="/v1/chat/completions", body=body, api_span=_capture_api_span())
     result = await worker.submit(job)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
@@ -275,16 +449,16 @@ async def chat_completions(request: Request):
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
     body = await request.json()
-    job = OllamaProxyJob(method="POST", path="/v1/embeddings", body=body)
+    job = OllamaProxyJob(method="POST", path="/v1/embeddings", body=body, api_span=_capture_api_span())
     result = await worker.submit(job)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
 
 @app.post("/api/generate")
 async def ollama_generate(request: Request):
-    """Proxy Ollama's native generate endpoint too."""
+    """Proxy Ollama's native generate endpoint."""
     body = await request.json()
-    job = OllamaProxyJob(method="POST", path="/api/generate", body=body)
+    job = OllamaProxyJob(method="POST", path="/api/generate", body=body, api_span=_capture_api_span())
     result = await worker.submit(job)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
@@ -293,7 +467,7 @@ async def ollama_generate(request: Request):
 async def ollama_chat(request: Request):
     """Proxy Ollama's native chat endpoint."""
     body = await request.json()
-    job = OllamaProxyJob(method="POST", path="/api/chat", body=body)
+    job = OllamaProxyJob(method="POST", path="/api/chat", body=body, api_span=_capture_api_span())
     result = await worker.submit(job)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
@@ -302,7 +476,7 @@ async def ollama_chat(request: Request):
 async def ollama_embeddings(request: Request):
     """Proxy Ollama's native embeddings endpoint."""
     body = await request.json()
-    job = OllamaProxyJob(method="POST", path="/api/embeddings", body=body)
+    job = OllamaProxyJob(method="POST", path="/api/embeddings", body=body, api_span=_capture_api_span())
     result = await worker.submit(job)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
@@ -310,7 +484,7 @@ async def ollama_embeddings(request: Request):
 @app.get("/api/tags")
 async def ollama_tags(request: Request):
     """Proxy Ollama's model list endpoint (used for health checks)."""
-    job = OllamaProxyJob(method="GET", path="/api/tags")
+    job = OllamaProxyJob(method="GET", path="/api/tags", api_span=_capture_api_span())
     result = await worker.submit(job)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
@@ -318,7 +492,7 @@ async def ollama_tags(request: Request):
 @app.get("/api/ps")
 async def ollama_ps(request: Request):
     """Proxy Ollama's running models endpoint."""
-    job = OllamaProxyJob(method="GET", path="/api/ps")
+    job = OllamaProxyJob(method="GET", path="/api/ps", api_span=_capture_api_span())
     result = await worker.submit(job)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
@@ -336,6 +510,7 @@ async def imagine(request: Request):
         width=body.get("width", 1024),
         height=body.get("height", 1024),
         seed=body.get("seed"),
+        api_span=_capture_api_span(),
     )
     result = await worker.submit(job)
     return JSONResponse(content=result)
