@@ -298,6 +298,31 @@ async def ollama_chat(request: Request):
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
 
+@app.post("/api/embeddings")
+async def ollama_embeddings(request: Request):
+    """Proxy Ollama's native embeddings endpoint."""
+    body = await request.json()
+    job = OllamaProxyJob(method="POST", path="/api/embeddings", body=body)
+    result = await worker.submit(job)
+    return JSONResponse(content=result["body"], status_code=result["status_code"])
+
+
+@app.get("/api/tags")
+async def ollama_tags(request: Request):
+    """Proxy Ollama's model list endpoint (used for health checks)."""
+    job = OllamaProxyJob(method="GET", path="/api/tags")
+    result = await worker.submit(job)
+    return JSONResponse(content=result["body"], status_code=result["status_code"])
+
+
+@app.get("/api/ps")
+async def ollama_ps(request: Request):
+    """Proxy Ollama's running models endpoint."""
+    job = OllamaProxyJob(method="GET", path="/api/ps")
+    result = await worker.submit(job)
+    return JSONResponse(content=result["body"], status_code=result["status_code"])
+
+
 # --- Imagination endpoint ---
 
 @app.post("/imagine")
