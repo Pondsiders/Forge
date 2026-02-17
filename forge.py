@@ -6,11 +6,6 @@
 #     "uvicorn",
 #     "httpx",
 #     "logfire[fastapi,httpx]",
-#     "torch",
-#     "diffusers",
-#     "transformers",
-#     "accelerate",
-#     "sentencepiece",
 #     "pillow",
 # ]
 # ///
@@ -18,8 +13,9 @@
 Forge — GPU arbiter for Pondside.
 
 Routes AI workloads through a single queue so the GPU is never contested.
-Proxies chat/embed requests to Ollama. Handles image generation directly
-via diffusers. One worker, one GPU, one job at a time.
+Proxies chat/embed requests to Ollama. Delegates image generation to a
+subprocess (forge_imagine.py) so VRAM is fully reclaimed on completion.
+One worker, one GPU, one job at a time.
 
 Instrumented with Logfire for full observability including gen_ai.* traces.
 
@@ -33,6 +29,7 @@ import base64
 import json
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -55,7 +52,7 @@ from opentelemetry.context import Context
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 FORGE_PORT = int(os.getenv("FORGE_PORT", "8200"))
 IMAGE_DIR = Path(os.getenv("FORGE_IMAGE_DIR", "/Pondside/Alpha-Home/images/imagination"))
-DEFAULT_IMAGE_MODEL = os.getenv("FORGE_IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+DEFAULT_IMAGE_MODEL = os.getenv("FORGE_IMAGE_MODEL", "Tongyi-MAI/Z-Image-Turbo")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("forge")
@@ -212,7 +209,12 @@ class OllamaProxyJob(Job):
 
 @dataclass
 class ImagineJob(Job):
-    """Generate an image via diffusers."""
+    """Generate an image via a subprocess.
+
+    Delegates to forge_imagine.py which loads the model, generates,
+    saves to disk, and exits. Process exit guarantees full VRAM cleanup —
+    no ghost allocations, no "sometimes," no anterograde amnesia at 2 AM.
+    """
     prompt: str = ""
     negative_prompt: str = ""
     model: str = ""
@@ -221,6 +223,9 @@ class ImagineJob(Job):
     height: int = 1024
     seed: int | None = None
 
+    # Path to the subprocess script (sibling of this file)
+    IMAGINE_SCRIPT: Path = Path(__file__).parent / "forge_imagine.py"
+
     def _set_api_attr(self, key: str, value: Any):
         """Set an attribute on the root FastAPI span."""
         if self.api_span and self.api_span.is_recording():
@@ -228,8 +233,7 @@ class ImagineJob(Job):
 
     async def execute(self, client: httpx.AsyncClient):
         """
-        The heavy lift: unload Ollama's model, load diffusion model,
-        generate image, save to disk, unload diffusion model.
+        Unload Ollama, spawn subprocess for generation, read result.
         Ollama reloads its model on next request automatically.
         """
         model_id = self.model or DEFAULT_IMAGE_MODEL
@@ -238,21 +242,72 @@ class ImagineJob(Job):
         self._set_api_attr("gen_ai.operation.name", "imagine")
         self._set_api_attr("gen_ai.provider.name", "diffusers")
         self._set_api_attr("gen_ai.request.model", model_id)
-        self._set_api_attr("gen_ai.input.messages", json.dumps([{"role": "user", "parts": [{"type": "text", "content": self.prompt}]}]))
+        self._set_api_attr("gen_ai.input.messages", json.dumps([
+            {"role": "user", "parts": [{"type": "text", "content": self.prompt}]}
+        ]))
 
         with logfire.span(
             "forge.imagine {model}",
             model=model_id,
             prompt_preview=self.prompt[:80],
         ) as span:
-            # Step 1: Ask Ollama to unload its model
+            # Step 1: Ask Ollama to unload its model to free VRAM
             with logfire.span("forge.imagine.ollama_unload"):
                 await _ollama_unload(client)
 
-            # Step 2: Generate image (runs in thread pool to not block event loop)
-            with logfire.span("forge.imagine.generate", steps=self.steps, width=self.width, height=self.height):
-                loop = asyncio.get_event_loop()
-                image_path, gen_time = await loop.run_in_executor(None, self._generate)
+            # Step 2: Generate image in subprocess
+            with logfire.span(
+                "forge.imagine.subprocess",
+                steps=self.steps,
+                width=self.width,
+                height=self.height,
+            ):
+                # Propagate trace context so subprocess spans nest here
+                from opentelemetry.propagate import inject as otel_inject
+                carrier: dict[str, str] = {}
+                otel_inject(carrier)
+
+                # Build job spec
+                spec = json.dumps({
+                    "prompt": self.prompt,
+                    "negative_prompt": self.negative_prompt,
+                    "model": model_id,
+                    "steps": self.steps,
+                    "width": self.width,
+                    "height": self.height,
+                    "seed": self.seed,
+                    "image_dir": str(IMAGE_DIR),
+                })
+
+                # Spawn — subprocess gets full env plus traceparent
+                env = {**os.environ, "TRACEPARENT": carrier.get("traceparent", "")}
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(self.IMAGINE_SCRIPT),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                stdout, stderr = await proc.communicate(input=spec.encode())
+
+                # Log subprocess output (model loading progress, etc.)
+                if stderr:
+                    for line in stderr.decode().strip().split("\n"):
+                        if line.strip():
+                            log.info(f"[imagine] {line}")
+
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"forge_imagine.py failed (exit {proc.returncode}): "
+                        f"{stderr.decode()[-500:]}"
+                    )
+
+                # Parse result — subprocess is dead, VRAM is free
+                # Take last non-empty line (libraries may print to stdout)
+                stdout_lines = [l for l in stdout.decode().strip().split("\n") if l.strip()]
+                result = json.loads(stdout_lines[-1])
+                image_path = Path(result["path"])
+                gen_time = result["generation_time"]
 
             span.set_attribute("forge.generation_time_s", gen_time)
             span.set_attribute("forge.image_path", str(image_path))
@@ -261,7 +316,9 @@ class ImagineJob(Job):
             self._set_api_attr("forge.generation_time_s", gen_time)
             self._set_api_attr(
                 "gen_ai.output.messages",
-                json.dumps([{"role": "assistant", "parts": [{"type": "text", "content": f"[image: {image_path.name}] ({gen_time:.1f}s)"}]}]),
+                json.dumps([{"role": "assistant", "parts": [
+                    {"type": "text", "content": f"[image: {image_path.name}] ({gen_time:.1f}s)"}
+                ]}]),
             )
 
             # Step 3: Build result with base64 image for direct context injection
@@ -277,47 +334,6 @@ class ImagineJob(Job):
                 "width": self.width,
                 "height": self.height,
             }
-
-    def _generate(self) -> tuple[Path, float]:
-        """Synchronous image generation. Runs in a thread."""
-        import torch
-        from diffusers import AutoPipelineForText2Image
-
-        model_id = self.model or DEFAULT_IMAGE_MODEL
-
-        t0 = time.time()
-        pipe = AutoPipelineForText2Image.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16,
-        ).to("cuda")
-
-        generator = None
-        if self.seed is not None:
-            generator = torch.Generator("cuda").manual_seed(self.seed)
-
-        image = pipe(
-            prompt=self.prompt,
-            negative_prompt=self.negative_prompt or None,
-            num_inference_steps=self.steps,
-            width=self.width,
-            height=self.height,
-            generator=generator,
-        ).images[0]
-
-        gen_time = time.time() - t0
-
-        # Save to disk
-        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"{timestamp}_{self.prompt[:50].replace(' ', '_').replace('/', '_')}.jpg"
-        image_path = IMAGE_DIR / filename
-        image.save(image_path, "JPEG", quality=90)
-
-        # Unload the diffusion model to free VRAM
-        del pipe
-        torch.cuda.empty_cache()
-
-        return image_path, gen_time
 
 
 # ---------------------------------------------------------------------------

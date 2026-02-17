@@ -1,0 +1,30 @@
+services:
+  forge:
+    build: .
+    ports:
+      - "8200:8200"
+    volumes:
+      # Mount HF cache from host — models are already downloaded
+      - /home/jefferyharrell/.cache/huggingface:/cache/huggingface
+      # Mount image output to Alpha-Home so images persist on host
+      - /Pondside/Alpha-Home/images/imagination:/Pondside/Alpha-Home/images/imagination
+    environment:
+      # Ollama runs on the host, not in the container
+      - OLLAMA_URL=http://host.docker.internal:11434
+      # Logfire token (read from host env or .env file)
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
+      # Disable xet for HF downloads inside container
+      - HF_HUB_DISABLE_XET=1
+      # Default image model — SDXL fits in 12GB VRAM comfortably
+      - FORGE_IMAGE_MODEL=stabilityai/stable-diffusion-xl-base-1.0
+    extra_hosts:
+      # Let the container reach host services (Ollama)
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
